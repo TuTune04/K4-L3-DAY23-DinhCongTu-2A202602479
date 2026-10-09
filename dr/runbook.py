@@ -38,19 +38,136 @@ LOG = pathlib.Path("reports/runbook-run.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
-def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
+def step(n, name, /, **kw):
+    record = {"ts": time.time(),
+              "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+              "step": n, "name": name, **kw}
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record)
+    with LOG.open("a") as log:
+        log.write(line + "\n")
+    print(line)
+    return record
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
+    if auto:
+        return True
+    try:
+        return input(f"{msg} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def events(path):
+    """Read complete JSONL records while another process may be appending."""
+    try:
+        lines = pathlib.Path(path).read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def alive(region, endpoint):
+    try:
+        return httpx.get(f"{URL[region]}/{endpoint}", timeout=2).status_code == 200
+    except Exception:
+        return False
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    start = time.time()
+    kills = [e for e in events("chaos/chaos-events.jsonl")
+             if e.get("action") == "kill" and e.get("region") == primary]
+    t_outage = kills[-1].get("ts") if kills else None
+    earliest = max(start - 600, t_outage or 0)
+    t_detect = None
+    source = "health_checker"
+    deadline = start + 90
+    while True:
+        alerts = [e for e in events("reports/health-events.jsonl")
+                  if e.get("event") == "state_change"
+                  and e.get("region") == primary and e.get("to") == "UNHEALTHY"
+                  and isinstance(e.get("ts"), (int, float))
+                  and e["ts"] >= earliest]
+        if alerts:
+            t_detect = alerts[-1]["ts"]
+            break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
+
+    if t_detect is None:
+        source = "runbook_probe"
+        failures = []
+        for i in range(3):
+            failed = not alive(primary, "readyz")
+            failures.append(failed)
+            if failed:
+                t_detect = time.time()
+            if i < 2:
+                time.sleep(5)
+        if not all(failures):
+            t_detect = None
+    confirmed = t_detect is not None
+    step(1, "xac_nhan_outage", confirmed=confirmed, t_detect=t_detect,
+         source=source, target_alive=alive(target, "healthz"))
+    if not confirmed:
+        return {"ok": False, "reason": "outage_not_confirmed"}
+
+    t_announce = time.time()
+    notify_delay_s = round(t_announce - t_outage, 2) if t_outage is not None else None
+    step(2, "thong_bao_incident", t_outage=t_outage,
+         t_outage_iso=(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t_outage))
+                       if t_outage is not None else None),
+         t_detect=t_detect, t_announce=t_announce, notify_delay_s=notify_delay_s)
+    if not confirm(auto, f"Cutover {primary} -> {target}?"):
+        step(2, "aborted_by_operator")
+        return {"ok": False}
+
+    res = fo.failover(target, backend, wait=60)
+    step(3, "scale_gpu_pool", ok=res["ok"], elapsed=res.get("elapsed_s"))
+    if not res["ok"]:
+        return {"ok": False, "t_detect": t_detect, "notify_delay_s": notify_delay_s,
+                "failover": res}
+
+    state = res["target_state"]
+    step(4, "verify_state_replica", count=state.get("count"),
+         weights=state.get("weights"), pool_state=state.get("pool_state"),
+         rpo_seconds=res.get("rpo_seconds"), docs_lost=res.get("docs_lost"),
+         embed_model_version=res.get("embed_model_version"))
+    step(5, "dns_cutover", ok=res["ok"], cutover_from=res.get("cutover_from"),
+         cutover_to=res.get("cutover_to"))
+
+    latencies = []
+    errors = 0
+    for _ in range(10):
+        request_start = time.perf_counter()
+        try:
+            response = httpx.get(f"{URL[target]}/v1/infer", timeout=3)
+            errors += response.status_code != 200
+        except Exception:
+            errors += 1
+        latencies.append((time.perf_counter() - request_start) * 1000)
+    ordered = sorted(latencies)
+    golden = {"n": 10, "p50_ms": round((ordered[4] + ordered[5]) / 2, 2),
+              "p95_ms": round(ordered[9], 2), "error_rate": errors / 10,
+              "latencies_ms": [round(ms, 2) for ms in latencies]}
+    step(6, "verify_golden_signals", **golden)
+    elapsed_s = round(time.time() - start, 2)
+    step(7, "post_incident", elapsed_s=elapsed_s,
+         measure_cmd="python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300")
+    return {"ok": res["ok"], "t_detect": t_detect, "notify_delay_s": notify_delay_s,
+            "failover": res, "golden_signals": golden, "elapsed_s": elapsed_s}
 
 
 if __name__ == "__main__":
